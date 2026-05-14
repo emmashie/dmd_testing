@@ -65,10 +65,10 @@ ALT_TRAIN_WINDOW        = 200    # Training block length (time steps)
 ALT_FORECAST_WINDOW     = 60     # Forecast block length (time steps)
 ALT_START_INDEX         = 0      # Starting time index for first training block
 
-# ---- Diagnostic Point (Probe) Location ----
-# Grid indices for time-series extraction (in full-domain before slicing).
-PROBE_X   = 250                  # X coordinate (xi dimension)
-PROBE_Y   = 100                  # Y coordinate (eta dimension)
+# ---- Diagnostic Probe Points ----
+# Optional list of probes as (x, y) full-domain indices (before slicing).
+# Set to None to auto-generate 5 points: center + one per quadrant.
+PROBE_POINTS_XY = None
 SNAP_STEP = 5                    # Which forecast step to visualize in snapshot comparison
 
 # ---- DMD Algorithm Hyperparameters ----
@@ -92,6 +92,15 @@ KDMD_DELAYS = 6
 KDMD_SIGMA  = None
 KDMD_RANK   = 25
 KDMD_REG    = 1e-8
+
+# Kernelized methods aligned with SpecRKHS example workflow
+KEDMD_SIGMA = None
+KEDMD_REG   = 1e-8
+
+SPECRKHS_SIGMA    = None
+SPECRKHS_REG      = 1e-8
+SPECRKHS_RES_TOL  = 0.2
+SPECRKHS_MIN_KEEP = 20
 
 RESDMD_POD_RANK   = 15
 RESDMD_DELAYS     = 4
@@ -275,12 +284,62 @@ if min_train_len < required_train_len:
 
 y0 = 0 if Y_SLICE.start is None else Y_SLICE.start
 x0 = 0 if X_SLICE.start is None else X_SLICE.start
-pyi = PROBE_Y - y0
-pxi = PROBE_X - x0
-if not (0 <= pyi < Ny and 0 <= pxi < Nx):
-    raise ValueError('Probe point lies outside the selected box.')
-if not mask[pyi, pxi]:
-    raise ValueError('Probe point is masked (land).')
+
+def default_probe_points_xy(x0, y0, nx, ny):
+    """Return default 5-point probe layout in full-domain index space."""
+    xc = x0 + nx // 2
+    yc = y0 + ny // 2
+    xl = x0 + nx // 4
+    xr = x0 + (3 * nx) // 4
+    yb = y0 + ny // 4
+    yt = y0 + (3 * ny) // 4
+    return [(xc, yc), (xl, yb), (xr, yb), (xl, yt), (xr, yt)]
+
+def snap_probe_to_valid(px_full, py_full, valid_mask, x0, y0):
+    """Snap a probe to the nearest valid point in the selected slice."""
+    pxi0 = int(px_full - x0)
+    pyi0 = int(py_full - y0)
+
+    if 0 <= pyi0 < Ny and 0 <= pxi0 < Nx and valid_mask[pyi0, pxi0]:
+        return int(px_full), int(py_full), pxi0, pyi0
+
+    best = None
+    max_r = max(Nx, Ny)
+    for r in range(0, max_r):
+        y_min = max(0, pyi0 - r)
+        y_max = min(Ny - 1, pyi0 + r)
+        x_min = max(0, pxi0 - r)
+        x_max = min(Nx - 1, pxi0 + r)
+        for yy in range(y_min, y_max + 1):
+            for xx in range(x_min, x_max + 1):
+                if valid_mask[yy, xx]:
+                    d2 = (yy - pyi0) ** 2 + (xx - pxi0) ** 2
+                    if best is None or d2 < best[0]:
+                        best = (d2, xx, yy)
+        if best is not None:
+            _, xx, yy = best
+            return x0 + xx, y0 + yy, xx, yy
+
+    raise RuntimeError('No valid probe points found in selected box.')
+
+requested_probes = PROBE_POINTS_XY
+if requested_probes is None:
+    requested_probes = default_probe_points_xy(x0, y0, Nx, Ny)
+
+if len(requested_probes) == 0:
+    raise ValueError('PROBE_POINTS_XY must contain at least one (x, y) point.')
+
+probe_points = []
+for i, (px_full, py_full) in enumerate(requested_probes):
+    px_full, py_full, pxi, pyi = snap_probe_to_valid(px_full, py_full, mask, x0, y0)
+    probe_points.append(
+        {'name': f'P{i+1}', 'x_full': int(px_full), 'y_full': int(py_full),
+         'pxi': int(pxi), 'pyi': int(pyi)}
+    )
+
+print('Using probe points (full-domain x, y):')
+for p in probe_points:
+    print(f"  {p['name']}: ({p['x_full']}, {p['y_full']})")
 
 # =====================================================================
 # GENERIC HELPERS FOR DMD METHODS
@@ -319,6 +378,29 @@ def poly_dict(x, order):
     for p in range(1, order + 1):
         feats.append(x ** p)
     return np.vstack(feats)
+
+def rbf_gram_cols(Xa, Xb, sigma=None):
+    """Gaussian RBF Gram matrix between columns of Xa and Xb.
+
+    Xa: (n_features, n_a), Xb: (n_features, n_b)
+    returns K: (n_a, n_b), plus sigma used.
+    """
+    na = np.sum(Xa * Xa, axis=0)[:, None]
+    nb = np.sum(Xb * Xb, axis=0)[None, :]
+    d2 = np.maximum(na + nb - 2.0 * (Xa.T @ Xb), 0.0)
+    if sigma is None:
+        nz = d2[d2 > 0]
+        sigma = np.sqrt(np.median(nz) + 1e-12) if nz.size else 1.0
+    K = np.exp(-d2 / (2.0 * sigma * sigma))
+    return K, sigma
+
+def generalized_eig_stable(A, G, reg=1e-8):
+    """Solve A v = lambda G v using regularized linear solve."""
+    n = G.shape[0]
+    G_reg = G + reg * np.eye(n)
+    M = np.linalg.solve(G_reg, A)
+    vals, vecs = eig(M)
+    return vals, vecs
 
 # =====================================================================
 # FORECAST METHODS
@@ -503,6 +585,112 @@ def kernel_dmd_forecast_field(Xtr, n_fc, d, sigma=None, r=15, reg=1e-8):
         out[:, i] = x_full[-nf:]
     return out
 
+def dmd_matlab_forecast_field(Xtr, n_fc):
+    """DMD forecast matching the MATLAB antarctic/sealevel workflow.
+
+    Uses reduced coordinates from SVD, eigendecomposition of the reduced map,
+    and modal reconstruction in the same style as the linked MATLAB scripts.
+    """
+    x = Xtr[:, :-1]
+    y = Xtr[:, 1:]
+    nf = Xtr.shape[0]
+
+    U, S, _ = svd(x, full_matrices=False)
+    r = int(np.sum(S > 1e-12))
+    r = max(r, 1)
+    U = U[:, :r]
+
+    PXs = x.T @ U
+    PYs = y.T @ U
+    K = np.linalg.lstsq(PXs, PYs, rcond=None)[0]
+
+    lam, W = eig(K)
+    PXr = PXs @ W
+    PYr = PYs @ W
+
+    rhs = np.hstack([x, y[:, -1:]]).T
+    c = np.linalg.lstsq(np.vstack([PXr[0:1, :], PYr]), rhs, rcond=None)[0]
+
+    out = np.zeros((nf, n_fc))
+    for i in range(n_fc):
+        weights = lam ** (i + 1)
+        out[:, i] = np.real((PYr[-1, :] * weights) @ c)
+    return out
+
+def kedmd_forecast_field(Xtr, n_fc, sigma=None, reg=1e-8):
+    """kEDMD forecast matching the MATLAB eig(A,G) Koopman mode workflow."""
+    x = Xtr[:, :-1]
+    y = Xtr[:, 1:]
+    x0 = Xtr[:, -1]
+    nf, m = x.shape
+
+    G, sigma_used = rbf_gram_cols(x, x, sigma)
+    A, _ = rbf_gram_cols(y, x, sigma_used)
+
+    lam, W = generalized_eig_stable(A, G, reg=reg)
+
+    G_start, _ = rbf_gram_cols(x0[:, None], x, sigma_used)
+    B = np.vstack([G, G_start]) @ W
+    targets = np.hstack([x, y[:, -1:]]).T
+    mode_full = np.linalg.lstsq(B, targets, rcond=None)[0].T
+    psi0_full = (G_start @ W).ravel()
+
+    out = np.zeros((nf, n_fc))
+    for i in range(n_fc):
+        wts = psi0_full * (np.conj(lam) ** (i + 1))
+        out[:, i] = np.real(wts @ mode_full.T)
+    return out
+
+def specrkhs_obs_forecast_field(Xtr, n_fc, sigma=None, reg=1e-8,
+                                res_tol=0.2, min_keep=20):
+    """SpecRKHS-Obs style forecast using kernel generalized eigenpairs.
+
+    Mirrors the observable-evolution structure in the MATLAB examples:
+      - build kernel matrices G, A, R from snapshot pairs,
+      - compute generalized Koopman eigenpairs,
+      - filter by residuals (SpecRKHS-inspired),
+      - evolve the observable expansion from the last training snapshot.
+    """
+    x = Xtr[:, :-1]
+    y = Xtr[:, 1:]
+    x0 = Xtr[:, -1]
+    nf = Xtr.shape[0]
+
+    G, sigma_used = rbf_gram_cols(x, x, sigma)
+    A, _ = rbf_gram_cols(y, x, sigma_used)
+    R, _ = rbf_gram_cols(y, y, sigma_used)
+
+    lam, F = generalized_eig_stable(A, G, reg=reg)
+
+    # Residual proxy used for filtering: ||A v - lambda G v|| / ||R v||
+    res = np.zeros(len(lam))
+    for j, lj in enumerate(lam):
+        v = F[:, j]
+        num = np.linalg.norm((A - lj * G) @ v)
+        den = np.linalg.norm(R @ v) + 1e-30
+        res[j] = num / den
+
+    keep = np.where(res < res_tol)[0]
+    if keep.size < min_keep:
+        keep = np.argsort(res)[:min(min_keep, len(lam))]
+    lam_k = lam[keep]
+    F_k = F[:, keep]
+
+    Kx0_vals, _ = rbf_gram_cols(x0[:, None], x, sigma_used)
+    Kx0_vals = Kx0_vals.ravel()
+
+    coefs = np.linalg.lstsq((G @ F_k), Kx0_vals, rcond=None)[0]
+    modes = F_k.conj().T @ x.T
+
+    out = np.zeros((nf, n_fc))
+    for i in range(n_fc):
+        wts = np.conj(coefs) * (np.conj(lam_k) ** (i + 1))
+        out[:, i] = np.real(wts @ modes)
+
+    print(f'[SpecRKHS-Obs] kept {len(keep)} / {len(lam)} eigenpairs '
+          f'(min res = {res.min():.2e}, max kept = {res[keep].max():.2e})')
+    return out
+
 def resdmd_forecast_field(Xtr, n_fc, pod_rank, d, order, tol, min_keep=1):
     """Residual DMD: filters spurious Koopman eigenpairs by residual error threshold.
 
@@ -627,6 +815,20 @@ print('  Kernel DMD...')
 forecasts_mat['Kernel DMD'] = run_method_over_segments(
     kernel_dmd_forecast_field, KDMD_DELAYS, KDMD_SIGMA, KDMD_RANK, KDMD_REG)
 
+print('  DMD (Matlab)...')
+forecasts_mat['DMD (Matlab)'] = run_method_over_segments(
+    dmd_matlab_forecast_field)
+
+print('  kEDMD...')
+forecasts_mat['kEDMD'] = run_method_over_segments(
+    kedmd_forecast_field, KEDMD_SIGMA, KEDMD_REG)
+
+print('  SpecRKHS-Obs...')
+forecasts_mat['SpecRKHS-Obs'] = run_method_over_segments(
+    specrkhs_obs_forecast_field,
+    SPECRKHS_SIGMA, SPECRKHS_REG,
+    SPECRKHS_RES_TOL, SPECRKHS_MIN_KEEP)
+
 print('  ResDMD...')
 forecasts_mat['ResDMD'] = run_method_over_segments(
     resdmd_forecast_field,
@@ -641,39 +843,35 @@ for name, f in forecasts_mat.items():
 # VISUALIZATION & ANALYSIS
 # =====================================================================
 # Generate 4 figures comparing forecast methods:
-# 1. Probe time series at (PROBE_Y, PROBE_X) + forecast error
+# 1. Multi-probe time series (separate panel per probe)
 # 2. Spatial RMSE map per method (grid-by-grid error)
 # 3. Snapshot comparison at one forecast step (spatial fields)
 # 4. Per-step forecast RMSE (error evolution in time)
 # Plus spatial snapshot frames (one PNG per forecast step)
 
 # =====================================================================
-# FIGURE 1 — Probe time series + error
+# FIGURE 1 — Multi-probe time series
 # =====================================================================
-# Top panel: velocity time series at probe location showing observed vs. all forecast methods
-# Bottom panel: forecast error (predicted - observed) evolution for each method
-# Red line at y=0 marks zero error. Watch how error diverges with time for each method.
+# One panel per probe point showing observed and all method forecasts.
+n_probe = len(probe_points)
+fig1_h = max(3.0 * n_probe, 6.0)
+fig1, axes1 = plt.subplots(n_probe, 1, figsize=(12, fig1_h), sharex=True, squeeze=False)
+axes1 = axes1.ravel()
 
-probe_obs  = U_cube[:, pyi, pxi]
-probe_true = U_cube[forecast_time_idx, pyi, pxi]
+for ip, p in enumerate(probe_points):
+    ax = axes1[ip]
+    pxi = p['pxi']
+    pyi = p['pyi']
+    probe_obs = U_cube[:, pyi, pxi]
+    ax.plot(t, probe_obs, 'k', lw=2, label='observed')
+    for name, fc in forecasts_cube.items():
+        ax.plot(t, fc[:, pyi, pxi], lw=1.2, label=name)
+    ax.set_ylabel('u')
+    ax.set_title(f"{p['name']} (x={p['x_full']}, y={p['y_full']})")
+    if ip == 0:
+        ax.legend(ncol=4, fontsize=8, loc='best')
 
-fig1, axes1 = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-
-axes1[0].plot(t, probe_obs, 'k', lw=2, label='observed')
-for name, fc in forecasts_cube.items():
-    axes1[0].plot(t, fc[:, pyi, pxi], '-o', lw=1.2, ms=3, label=name)
-axes1[0].set_ylabel('u')
-axes1[0].set_title(f'Probe (x={PROBE_X}, y={PROBE_Y}) — forecasts')
-axes1[0].legend(ncol=3, fontsize=8, loc='best')
-
-for name, fc in forecasts_cube.items():
-    err_probe = fc[forecast_time_idx, pyi, pxi] - probe_true
-    axes1[1].plot(forecast_time_idx, err_probe, lw=1.2, label=name)
-axes1[1].axhline(0, color='k', lw=0.5)
-axes1[1].set_ylabel('forecast − truth')
-axes1[1].set_xlabel('time index')
-axes1[1].set_title('Probe forecast error')
-axes1[1].legend(ncol=3, fontsize=8, loc='best')
+axes1[-1].set_xlabel('time index')
 
 plt.tight_layout()
 fig1.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure1_probe_timeseries_error.png'), dpi=150)
@@ -685,7 +883,7 @@ fig1.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure1_probe_timeseries_error.png')
 # FIGURE 2 — Spatial RMSE map per method
 # =====================================================================
 # Grid-by-grid error magnitude for each method (averaged over all forecast steps).
-# Identifies regional strengths/weaknesses. Red 'X' marks probe location.
+# Identifies regional strengths/weaknesses. White 'X' markers show probe points.
 # Common color scale across all subplots aids visual comparison.
 # Title shows spatial mean RMSE for quick ranking of methods.
 method_names = list(forecasts_cube.keys())
@@ -711,7 +909,8 @@ for k, name in enumerate(method_names):
                    vmin=vmin, vmax=vmax, cmap='viridis')
     ax.set_title(f'{name}  (mean={np.nanmean(rmse_maps[name]):.3e})',
                  fontsize=9)
-    ax.plot(pxi, pyi, 'rx', ms=8, mew=2)  # mark probe
+    for p in probe_points:
+        ax.plot(p['pxi'], p['pyi'], 'wx', ms=6, mew=1.5)
     ax.set_xticks([]); ax.set_yticks([])
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -734,7 +933,7 @@ fig2.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure2_spatial_rmse_map.png'), dpi=
 # Left panel: ground truth velocity field at this time
 # Other panels: each method's predicted field at the same time
 # Same color scale across all panels (derived from truth range)
-# Red 'X' marks probe location for spatial reference
+# White 'X' markers show probe locations for spatial reference
 snap = int(np.clip(SNAP_STEP, 0, n_fc - 1))
 snap_t = int(forecast_time_idx[snap])
 truth_snap = U_cube[snap_t]
@@ -754,7 +953,8 @@ fig3, axes3 = plt.subplots(nrows3, ncols3,
 ax = axes3[0, 0]
 im = ax.imshow(truth_snap, origin='lower', vmin=tmin, vmax=tmax, cmap='RdBu_r')
 ax.set_title(f'Truth (forecast step {snap}, t={snap_t})', fontsize=9)
-ax.plot(pxi, pyi, 'kx', ms=8, mew=2)
+for p in probe_points:
+    ax.plot(p['pxi'], p['pyi'], 'kx', ms=6, mew=1.5)
 ax.set_xticks([]); ax.set_yticks([])
 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -763,7 +963,8 @@ for k, name in enumerate(method_names, start=1):
     im = ax.imshow(forecasts_cube[name][snap_t], origin='lower',
                    vmin=tmin, vmax=tmax, cmap='RdBu_r')
     ax.set_title(name, fontsize=9)
-    ax.plot(pxi, pyi, 'kx', ms=8, mew=2)
+    for p in probe_points:
+        ax.plot(p['pxi'], p['pyi'], 'kx', ms=6, mew=1.5)
     ax.set_xticks([]); ax.set_yticks([])
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -818,7 +1019,8 @@ if SAVE_SPATIAL_SNAPSHOTS:
         im = ax.imshow(U_cube[tt], origin='lower',
                        vmin=vmin, vmax=vmax, cmap=SPATIAL_CMAP)
         ax.set_title(f'Truth  (t={tt})', fontsize=9)
-        ax.plot(pxi, pyi, 'kx', ms=6, mew=1.5)
+        for p in probe_points:
+            ax.plot(p['pxi'], p['pyi'], 'kx', ms=5, mew=1.2)
         ax.set_xticks([]); ax.set_yticks([])
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -827,7 +1029,8 @@ if SAVE_SPATIAL_SNAPSHOTS:
             im = ax.imshow(forecasts_cube[name][tt], origin='lower',
                            vmin=vmin, vmax=vmax, cmap=SPATIAL_CMAP)
             ax.set_title(name, fontsize=9)
-            ax.plot(pxi, pyi, 'kx', ms=6, mew=1.5)
+            for p in probe_points:
+                ax.plot(p['pxi'], p['pyi'], 'kx', ms=5, mew=1.2)
             ax.set_xticks([]); ax.set_yticks([])
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -878,16 +1081,20 @@ plt.tight_layout()
 # =====================================================================
 # Print summary statistics comparing forecast skill across all methods.
 # - Field RMSE: error averaged over space (all wet points) and time (all forecast steps)
-# - Probe RMSE: error at single grid point (PROBE_X, PROBE_Y) only
+# - Probe RMSE: error averaged across configured probe-point set
 # Lower RMSE is better. Per-step table shows how error grows with forecast lead time.
 print('\nForecast RMSE (space+time averaged over wet points):')
 for name, fc in forecasts_cube.items():
     err = fc - U_cube
     rmse_full  = float(np.sqrt(np.nanmean(err ** 2)))
-    rmse_probe = float(np.sqrt(np.nanmean(
-        (fc[:, pyi, pxi] - U_cube[:, pyi, pxi]) ** 2)))
+    probe_sqerr = []
+    for p in probe_points:
+        pyi = p['pyi']
+        pxi = p['pxi']
+        probe_sqerr.append((fc[:, pyi, pxi] - U_cube[:, pyi, pxi]) ** 2)
+    rmse_probe = float(np.sqrt(np.nanmean(np.stack(probe_sqerr, axis=0))))
     print(f'  {name:16s}  field RMSE = {rmse_full:.4e}   '
-          f'probe RMSE = {rmse_probe:.4e}')
+          f'probe-set RMSE = {rmse_probe:.4e}')
 
 # Per-step (time-resolved) field RMSE, optional summary
 print('\nPer-step field RMSE (first 5 forecast steps):')
