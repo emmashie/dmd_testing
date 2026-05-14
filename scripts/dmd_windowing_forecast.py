@@ -1,12 +1,28 @@
-"""
-Forecasting a 2-D velocity field u(t, y, x) with several DMD variants:
-  1. Standard DMD
-  2. Sliding-window DMD
-  3. Hankel (time-delay) DMD
-  4. Sliding-window Hankel DMD
-  5. Extended DMD (EDMD) with polynomial dictionary on POD coefficients
-  6. Kernel DMD (Gaussian RBF kernel) on delay-embedded snapshots
-  7. Residual DMD (ResDMD) — filters spurious Koopman eigenpairs
+"""Forecasting a 2-D velocity field u(t, y, x) with several DMD variants.
+
+DYNAMIC MODE DECOMPOSITION (DMD) COMPARISON FRAMEWORK
+======================================================
+This script loads spatiotemporal oceanographic data, partitions it into
+alternating train/forecast windows, and applies seven different DMD variants
+to predict future velocity fields. Results are compared across methods via
+spatial RMSE maps, probe time series, and snapshot visualizations.
+
+METHODS IMPLEMENTED:
+  1. Standard DMD          : Classical DMD on raw data snapshots
+  2. Sliding-window DMD    : DMD with window re-fitting during forecast
+  3. Hankel DMD            : Time-delay embedding with fixed delays
+  4. Sliding Hankel        : Hankel DMD with sliding window updates
+  5. EDMD (poly)           : Extended DMD using POD + polynomial dictionary
+  6. Kernel DMD            : Nonlinear DMD with Gaussian RBF kernel
+  7. ResDMD                : Residual-filtered DMD (removes spurious modes)
+
+WORKFLOW:
+  - Load data from NetCDF files (configurable variable & time range)
+  - Mask invalid/land points
+  - Partition time series into alternating train/forecast segments
+  - Run each method over all segments
+  - Compute and visualize error metrics
+  - Export spatial snapshots per forecast step
 """
 import os
 import glob
@@ -14,42 +30,50 @@ import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
 from numpy.linalg import pinv, svd, eig
+from cmocean import cm as cmo
 plt.ioff()
 
 # =====================================================================
 # TUNABLE PARAMETERS
 # =====================================================================
-DATA_DIR         = '/compass/ber200006/seahorce/dmd_testing/data'
-FILE_PATTERNS    = ['u*.nc']
-VARIABLE_CHOICES = ['u']
+# Configure data source, time/space selection, windowing strategy, and DMD variants.
+# All parameters can be adjusted without modifying the core forecast logic.
 
-# Optional time subset over the concatenated record.
-# Use None to keep full record.
-TIME_START = None
-TIME_STOP  = None
-TIME_STEP  = 1
+DATA_DIR         = '../data'
+FILE_PATTERNS    = ['u*.nc']     # Glob patterns to match files in DATA_DIR (e.g., ['u*.nc', 'v*.nc'])
+VARIABLE_CHOICES = ['u']         # Variable names to search for (in priority order; first match used)
 
-# Optional spatial subset in ROMS (eta_u, xi_u) index space.
-X_SLICE = slice(None)
-Y_SLICE = slice(None)
+# ---- Time Subset Configuration ----
+# Optional temporal subset of the concatenated record. Set both to None for full record.
+TIME_START = None                # Start time index (None = beginning)
+TIME_STOP  = None                # Stop time index (None = end)
+TIME_STEP  = 1                   # Time subsampling stride
 
-# Legacy single-block train/forecast split (used when
-# USE_ALTERNATING_WINDOWS=False)
-N_TRAIN = 300
+# ---- Spatial Subset Configuration ----
+# Slice indices in ROMS horizontal grid (eta_u/xi_u for u-component).
+X_SLICE = slice(None)            # Apply None to use full x-dimension
+Y_SLICE = slice(None)            # Apply None to use full y-dimension
 
-# If True, alternate train/forecast windows across the full time series.
-# If False, keep legacy behavior: one train block [0:N_TRAIN), one forecast block [N_TRAIN:Nt).
-USE_ALTERNATING_WINDOWS = True
-ALT_TRAIN_WINDOW        = 200
-ALT_FORECAST_WINDOW     = 60
-ALT_START_INDEX         = 0
+# ---- Training/Forecast Window Configuration ----
+# Strategy 1: Single train/test split (when USE_ALTERNATING_WINDOWS=False)
+N_TRAIN = 300                    # Length of single training block
 
-# Probe location in full-domain index space (before applying X/Y slices)
-PROBE_X   = 250
-PROBE_Y   = 100
-SNAP_STEP = 5
+# Strategy 2: Alternating train/forecast windows (when USE_ALTERNATING_WINDOWS=True)
+# Cycle through entire time series, alternating fixed-length train/forecast blocks.
+USE_ALTERNATING_WINDOWS = True   # Toggle between windowing strategies
+ALT_TRAIN_WINDOW        = 200    # Training block length (time steps)
+ALT_FORECAST_WINDOW     = 60     # Forecast block length (time steps)
+ALT_START_INDEX         = 0      # Starting time index for first training block
 
-DMD_RANK  = 20
+# ---- Diagnostic Point (Probe) Location ----
+# Grid indices for time-series extraction (in full-domain before slicing).
+PROBE_X   = 250                  # X coordinate (xi dimension)
+PROBE_Y   = 100                  # Y coordinate (eta dimension)
+SNAP_STEP = 5                    # Which forecast step to visualize in snapshot comparison
+
+# ---- DMD Algorithm Hyperparameters ----
+# Rank/dimension controls for each method (higher = more complex, higher cost).
+DMD_RANK  = 20                   # SVD truncation rank for standard DMD
 
 SW_WINDOW = 120
 SW_RANK   = 15
@@ -75,17 +99,23 @@ RESDMD_POLY_ORDER = 2
 RESDMD_TOL        = 0.5
 RESDMD_MIN_KEEP   = 8
 
-# ---- spatial snapshot export ----
-PLOT_OUTPUT_DIR         = '/compass/ber200006/seahorce/dmd_testing/plots'
+# ---- Output Configuration ----
+# All figures and spatial snapshots saved to PLOT_OUTPUT_DIR.
+PLOT_OUTPUT_DIR         = '../plots'  # Root directory for all plot outputs
 SAVE_SPATIAL_SNAPSHOTS = True
 SPATIAL_SNAPSHOT_DIR   = 'spatial_snapshots'
 SPATIAL_SNAPSHOT_DPI   = 120
-SPATIAL_CMAP           = 'RdBu_r'
+SPATIAL_CMAP           = cmo.balance
 SPATIAL_COLOR_LIMIT    = None   # set numeric value to force +/- symmetric limit
 
 # =====================================================================
 # LOAD DATA -> (t, y, x)
 # =====================================================================
+# 1. Expand file patterns using glob and concatenate all matched files.
+# 2. Select requested variable (first match from VARIABLE_CHOICES).
+# 3. Apply optional time/space subsetting (masking invalid/land points).
+# 4. Extract to numpy array and convert to 2D matrix format for DMD analysis.
+
 file_globs = [os.path.join(DATA_DIR, pat) for pat in FILE_PATTERNS]
 matched_files = sorted({f for pat in file_globs for f in glob.glob(pat)})
 if not matched_files:
@@ -133,6 +163,10 @@ U_cube = u_sub.values.astype(float)
 Nt, Ny, Nx = U_cube.shape
 print(f"Loaded variable '{var_name}' cube (t,y,x) = {U_cube.shape}")
 
+# ---- Masking: identify valid (non-land) grid points ----
+# ROMS data contains NaN at land points. A point is "valid" if it has
+# finite values at ALL time steps (valid over entire time series).
+# This ensures DMD analysis only uses consistently wet points.
 mask = np.isfinite(U_cube).all(axis=0)
 n_valid = int(mask.sum())
 print(f'Valid (wet) points: {n_valid} / {Ny*Nx}')
@@ -140,19 +174,49 @@ if n_valid == 0:
     raise RuntimeError('No valid points in selected box.')
 
 def cube_to_mat(cube):
+    """Convert spatial-temporal cube to two-dimensional matrix for DMD analysis.
+    
+    Reshapes (t, y, x) array into (t, y*x) flattened form, applies spatial mask,
+    then transposes to (n_valid, t) format for DMD methods.
+    DMD convention: columns = time snapshots, rows = spatial grid points.
+    Only valid (non-NaN, wet ocean) points are retained.
+    
+    Args:
+        cube: array of shape (Nt, Ny, Nx)
+    Returns:
+        matrix: array of shape (n_valid_spatial_points, Nt)
+    """
     return cube.reshape(cube.shape[0], -1)[:, mask.ravel()].T
 
 def mat_to_cube(mat):
+    """Inverse of cube_to_mat: convert matrix back to three-dimensional spatial cube.
+    
+    Reconstructs (n_valid, t) matrix into (t, y*x) flattened then (t, y, x) cube format.
+    Non-valid masked points are filled with NaN to preserve original domain shape.
+    
+    Args:
+        mat: array of shape (n_valid_spatial_points, Nt)
+    Returns:
+        cube: array of shape (Nt, Ny, Nx) with NaN at masked points
+    """
     t_dim = mat.shape[1]
     out = np.full((t_dim, Ny * Nx), np.nan)
     out[:, mask.ravel()] = mat.T
     return out.reshape(t_dim, Ny, Nx)
 
-Xmat       = cube_to_mat(U_cube)
-t          = np.arange(Nt)
+Xmat       = cube_to_mat(U_cube)   # (n_valid, Nt) matrix of valid-only points
+t          = np.arange(Nt)            # Time index array for plotting
 
 def build_forecast_segments(nt, use_alternating, n_train,
                             alt_train, alt_fc, alt_start):
+    """Partition time series into train/forecast blocks.
+    
+    Returns list of tuples (train_start, train_end, forecast_start, forecast_end).
+    
+    Two modes:
+      - use_alternating=True: cycles through record with fixed window sizes
+      - use_alternating=False: single train block at start, rest is forecast block
+    """
     segments = []
     if use_alternating:
         if alt_train < 2:
@@ -219,13 +283,25 @@ if not mask[pyi, pxi]:
     raise ValueError('Probe point is masked (land).')
 
 # =====================================================================
-# GENERIC HELPERS
+# GENERIC HELPERS FOR DMD METHODS
 # =====================================================================
 def build_hankel_mat(X, d):
+    """Construct Hankel (time-delay embedding) matrix from data.
+    
+    Stacks d consecutive snapshots as rows: [X[0:n], X[1:n+1], ..., X[d-1:n+d-1]]
+    Input: X shape (n_features, m_samples)
+    Output: shape (d*n_features, m_samples-d+1)
+    Used for delay-embedding methods (Hankel DMD, EDMD, etc.)
+    """
     n = X.shape[1] - d + 1
     return np.vstack([X[:, i:i + n] for i in range(d)])
 
 def dmd_fit(X, Y, r=None):
+    """Fit DMD Koopman matrix A from data pairs: X (input snapshots) and Y (output snapshots).
+    
+    Solves: A = Y @ X-dagger (pseudoinverse solution in POD basis).
+    Returns (A_t, U_r): DMD matrix in POD space and POD basis vectors (first r modes).
+    """
     U, S, Vt = svd(X, full_matrices=False)
     if r is None or r > len(S):
         r = len(S)
@@ -234,15 +310,28 @@ def dmd_fit(X, Y, r=None):
     return A_t, U_r
 
 def poly_dict(x, order):
+    """Build polynomial dictionary for extended DMD (EDMD).
+    
+    Returns feature vector: [1, x, x^2, ..., x^order] stacked as rows.
+    Used by EDMD and ResDMD to capture nonlinear Koopman operators.
+    """
     feats = [np.ones((1, x.shape[1]))]
     for p in range(1, order + 1):
         feats.append(x ** p)
     return np.vstack(feats)
 
 # =====================================================================
-# FORECAST METHODS (all return (n_valid, n_fc))
+# FORECAST METHODS
 # =====================================================================
+# All forecast methods accept training data (n_valid, n_train) and return
+# predictions over n_fc forecast steps: shape (n_valid, n_fc)
+# Forecast values are set to NaN outside requested forecast windows.
+
 def dmd_forecast_field(Xtr, n_fc, r=None):
+    """Standard DMD: fit once on training data, iterate forward using Koopman operator.
+    
+    Simplest method; assumes linear dynamics. Sensitive to rank choice.
+    """
     X, Y = Xtr[:, :-1], Xtr[:, 1:]
     A_t, U_r = dmd_fit(X, Y, r)
     z = U_r.conj().T @ Xtr[:, -1]
@@ -253,6 +342,14 @@ def dmd_forecast_field(Xtr, n_fc, r=None):
     return out
 
 def sliding_dmd_forecast_field(Xtr, n_fc, window, r=None, stride=1):
+    """Sliding-window DMD: re-fit every `stride` steps with most recent `window` snapshots.
+    
+    Adapts to time-varying dynamics by periodically re-training on recent data.
+    Key parameters:
+      - window: number of recent snapshots to use for each DMD fit
+      - stride: how often to re-fit (stride=1 means every step, higher = more efficient)
+    Often captures evolving modes better than standard DMD but costs more computationally.
+    """
     hist = Xtr.copy()
     nf = Xtr.shape[0]
     out = np.zeros((nf, n_fc))
@@ -269,6 +366,10 @@ def sliding_dmd_forecast_field(Xtr, n_fc, window, r=None, stride=1):
     return out
 
 def hankel_dmd_forecast_field(Xtr, n_fc, d, r=None):
+    """Hankel DMD: uses time-delay embedding to expose hidden linear structure.
+    
+    Delay parameter d captures temporal correlations; often more efficient than standard DMD.
+    """
     H = build_hankel_mat(Xtr, d)
     A_t, U_r = dmd_fit(H[:, :-1], H[:, 1:], r)
     z = U_r.conj().T @ H[:, -1]
@@ -281,6 +382,16 @@ def hankel_dmd_forecast_field(Xtr, n_fc, d, r=None):
     return out
 
 def sliding_hankel_dmd_forecast_field(Xtr, n_fc, window, d, r=None, stride=1):
+    """Sliding Hankel DMD: combines sliding window adaptation with delay embedding.
+    
+    Periodically re-fits Hankel DMD on most recent `window` snapshots.
+    Balances computational cost and adaptability better than standard methods.
+    
+    Key tuning:
+      - window: length of recent data for each DMD fit
+      - d: delay dimension in Hankel embedding
+      - stride: how often to re-fit
+    """
     hist = Xtr.copy()
     nf = Xtr.shape[0]
     out = np.zeros((nf, n_fc))
@@ -300,6 +411,21 @@ def sliding_hankel_dmd_forecast_field(Xtr, n_fc, window, d, r=None, stride=1):
     return out
 
 def edmd_forecast_field(Xtr, n_fc, pod_rank, d, order):
+    """Extended DMD (EDMD): POD reduction + Hankel delay embedding + polynomial dictionary.
+    
+    Three-step approach to capture weakly nonlinear Koopman operator:
+      1. Apply POD to reduce dimension to pod_rank basis vectors
+      2. Delay-embed POD coefficients with d delays (Hankel matrix)
+      3. Fit polynomial Koopman operator using polynomial dictionary of order `order`
+    
+    Often provides best balance of accuracy and computational efficiency.
+    Polynomial coefficients allow capturing nonlinear mode interactions.
+    
+    Key tuning:
+      - pod_rank: initial dimension reduction (lower = cheaper, may lose structure)
+      - d: time-delay embedding dimension (higher = more temporal context)
+      - order: polynomial dictionary order (higher = more nonlinearity captured)
+    """
     U, S, Vt = svd(Xtr, full_matrices=False)
     r = min(pod_rank, len(S))
     U_r = U[:, :r]
@@ -322,7 +448,20 @@ def edmd_forecast_field(Xtr, n_fc, pod_rank, d, order):
     return out
 
 def kernel_dmd_forecast_field(Xtr, n_fc, d, sigma=None, r=15, reg=1e-8):
-    """Kernel DMD with Gaussian RBF on delay-embedded snapshots."""
+    """Kernel DMD: Gaussian RBF kernel applied to delay-embedded snapshots.
+    
+    Captures strongly nonlinear dynamics by lifting data into kernel Hilbert space.
+    Uses Hankel delay embedding (d snapshots stacked) to expose hidden structure,
+    then applies RBF kernel to measure similarity in delay-embedded space.
+    
+    Key tuning:
+      - d: delay dimension (higher = more temporal context, more cost)
+      - sigma: RBF bandwidth (auto-computed from median pairwise distance if None)
+      - r: rank in kernel feature space
+      - reg: Tikhonov regularization (prevents overfitting in decoding)
+    
+    Often best for capturing transient or chaotic dynamics, but expensive.
+    """
     H = build_hankel_mat(Xtr, d)           # (d*nf, nt-d+1)
     nf = Xtr.shape[0]
     X = H[:, :-1].T                        # (m, d*nf)
@@ -365,14 +504,17 @@ def kernel_dmd_forecast_field(Xtr, n_fc, d, sigma=None, r=15, reg=1e-8):
     return out
 
 def resdmd_forecast_field(Xtr, n_fc, pod_rank, d, order, tol, min_keep=1):
-    """Residual DMD on POD-coefficient delay embedding.
+    """Residual DMD: filters spurious Koopman eigenpairs by residual error threshold.
 
-    Build EDMD on a polynomial dictionary of delay-embedded POD
-    coefficients, then compute each Koopman eigenpair's residual
-        res(λ, v)^2 = v* (L - λ̄ A - λ A* + |λ|² G) v  /  v* G v
-    with  G = Φ_X Φ_X*/m,  A = Φ_X Φ_Y*/m,  L = Φ_Y Φ_Y*/m.
-    Keep only eigenpairs with residual < tol (fallback to `min_keep`
-    smallest), then forecast with the filtered spectral expansion.
+    Combines EDMD framework with residual-based quality filtering:
+      1. Reduce to POD basis
+      2. Delay-embed and apply polynomial Koopman operator (like EDMD)
+      3. Compute residual error for each Koopman eigenpair
+      4. Keep only low-residual pairs (reliable modes)
+      5. Forecast using filtered spectral expansion
+    
+    Removes spurious modes that fit noise rather than true dynamics.
+    Often produces sharp forecasts (captures key modes only).
     """
     # 1. POD reduction
     U, S, Vt = svd(Xtr, full_matrices=False)
@@ -432,12 +574,20 @@ def resdmd_forecast_field(Xtr, n_fc, pod_rank, d, order, tol, min_keep=1):
     return out
 
 # =====================================================================
-# RUN ALL FORECASTS
+# RUN ALL FORECASTS OVER SEGMENTS
 # =====================================================================
+# For each train/forecast segment pair, run all 7 DMD methods.
+# Collect results in (n_valid, Nt) matrices with NaN outside forecast windows.
+# Then convert back to (Nt, Ny, Nx) cubes for visualization and error analysis.
 forecasts_mat  = {}        # (n_valid, Nt), NaN outside forecast windows
 forecasts_cube = {}        # (Nt, Ny, Nx), NaN outside forecast windows
 
 def run_method_over_segments(method_fn, *args):
+    """Apply a single forecast method across all train/forecast segments.
+    
+    Assembles results into a single (n_valid, Nt) array with results inside
+    forecast windows and NaN elsewhere.
+    """
     full = np.full((Xmat.shape[0], Nt), np.nan)
     for tr0, tr1, fc0, fc1 in segments:
         Xtr = Xmat[:, tr0:tr1]
@@ -488,8 +638,22 @@ for name, f in forecasts_mat.items():
     forecasts_cube[name] = mat_to_cube(f)
 
 # =====================================================================
+# VISUALIZATION & ANALYSIS
+# =====================================================================
+# Generate 4 figures comparing forecast methods:
+# 1. Probe time series at (PROBE_Y, PROBE_X) + forecast error
+# 2. Spatial RMSE map per method (grid-by-grid error)
+# 3. Snapshot comparison at one forecast step (spatial fields)
+# 4. Per-step forecast RMSE (error evolution in time)
+# Plus spatial snapshot frames (one PNG per forecast step)
+
+# =====================================================================
 # FIGURE 1 — Probe time series + error
 # =====================================================================
+# Top panel: velocity time series at probe location showing observed vs. all forecast methods
+# Bottom panel: forecast error (predicted - observed) evolution for each method
+# Red line at y=0 marks zero error. Watch how error diverges with time for each method.
+
 probe_obs  = U_cube[:, pyi, pxi]
 probe_true = U_cube[forecast_time_idx, pyi, pxi]
 
@@ -517,6 +681,13 @@ fig1.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure1_probe_timeseries_error.png')
 # =====================================================================
 # FIGURE 2 — Spatial RMSE map per method
 # =====================================================================
+# =====================================================================
+# FIGURE 2 — Spatial RMSE map per method
+# =====================================================================
+# Grid-by-grid error magnitude for each method (averaged over all forecast steps).
+# Identifies regional strengths/weaknesses. Red 'X' marks probe location.
+# Common color scale across all subplots aids visual comparison.
+# Title shows spatial mean RMSE for quick ranking of methods.
 method_names = list(forecasts_cube.keys())
 nm = len(method_names)
 ncols = 4
@@ -556,6 +727,14 @@ fig2.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure2_spatial_rmse_map.png'), dpi=
 # =====================================================================
 # FIGURE 3 — Snapshot comparison at step SNAP_STEP
 # =====================================================================
+# =====================================================================
+# FIGURE 3 — Snapshot comparison at step SNAP_STEP
+# =====================================================================
+# Snapshot view at a representative forecast step showing truth + all method predictions.
+# Left panel: ground truth velocity field at this time
+# Other panels: each method's predicted field at the same time
+# Same color scale across all panels (derived from truth range)
+# Red 'X' marks probe location for spatial reference
 snap = int(np.clip(SNAP_STEP, 0, n_fc - 1))
 snap_t = int(forecast_time_idx[snap])
 truth_snap = U_cube[snap_t]
@@ -600,6 +779,13 @@ fig3.savefig(os.path.join(PLOT_OUTPUT_DIR, 'figure3_snapshot_comparison.png'), d
 # SAVE 2D SPATIAL SNAPSHOT FRAMES  (one PNG per forecast step)
 # Each frame shows truth on the left + one panel per method
 # =====================================================================
+# =====================================================================
+# SAVE 2D SPATIAL SNAPSHOT FRAMES  (one PNG per forecast step)
+# =====================================================================
+# Export spatial field snapshots to create visual time-lapse comparison.
+# Each frame shows: truth (left) + one panel per method (showing predicted field).
+# Useful for identifying where/when each method succeeds or fails.
+# Set SAVE_SPATIAL_SNAPSHOTS=False to skip (saves disk space & time).
 if SAVE_SPATIAL_SNAPSHOTS:
     out_dir = os.path.join(PLOT_OUTPUT_DIR, SPATIAL_SNAPSHOT_DIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -660,6 +846,14 @@ if SAVE_SPATIAL_SNAPSHOTS:
 # =====================================================================
 # FIGURE 4 — Per-step spatial RMSE time series
 # =====================================================================
+# =====================================================================
+# FIGURE 4 — Per-step spatial RMSE time series
+# =====================================================================
+# Time-resolved forecast skill: shows how error grows from step 0 (best, shortest lead time)
+# to final forecast step (worst, longest lead time).
+# Steep rise = method loses skill quickly
+# Gentle slope = method maintains coherent predictions longer
+# Useful for understanding predictability horizon and method reliability
 fig4, ax4 = plt.subplots(1, 1, figsize=(11, 6))
 
 for name, fc in forecasts_cube.items():
@@ -679,6 +873,13 @@ plt.tight_layout()
 # =====================================================================
 # RMSE REPORT
 # =====================================================================
+# =====================================================================
+# RMSE REPORT
+# =====================================================================
+# Print summary statistics comparing forecast skill across all methods.
+# - Field RMSE: error averaged over space (all wet points) and time (all forecast steps)
+# - Probe RMSE: error at single grid point (PROBE_X, PROBE_Y) only
+# Lower RMSE is better. Per-step table shows how error grows with forecast lead time.
 print('\nForecast RMSE (space+time averaged over wet points):')
 for name, fc in forecasts_cube.items():
     err = fc - U_cube
