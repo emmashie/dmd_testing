@@ -68,3 +68,7 @@ venv.bak/
 *.swo
 *~
 .DS_Store
+
+# DMD spatial snapshot frames
+plots/univar/spatial_snapshots/
+plots/multivar/spatial_snapshots_*/

@@ -39,8 +39,22 @@ plt.ioff()
 # Configure data source, time/space selection, windowing strategy, and DMD variants.
 # All parameters can be adjusted without modifying the core forecast logic.
 
-DATA_DIR         = '../data'
-FILE_PATTERNS    = ['u*.nc']     # Glob patterns to match files in DATA_DIR (e.g., ['u*.nc', 'v*.nc'])
+# Select dataset source from data folder subdirectories: 'roms' or 'remora'.
+DATA_SOURCE      = 'remora'
+SCRIPT_DIR       = (
+    os.path.dirname(os.path.abspath(__file__))
+    if '__file__' in globals()
+    else os.getcwd()
+)
+_DATA_ROOT_CANDIDATES = [
+    os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'data')),
+    os.path.normpath(os.path.join(SCRIPT_DIR, 'data')),
+    os.path.normpath(os.path.join(os.getcwd(), '..', 'data')),
+    os.path.normpath(os.path.join(os.getcwd(), 'data')),
+]
+DATA_ROOT        = next((p for p in _DATA_ROOT_CANDIDATES if os.path.isdir(p)), _DATA_ROOT_CANDIDATES[0])
+DATA_DIR         = os.path.join(DATA_ROOT, DATA_SOURCE)
+FILE_PATTERNS    = ['u.nc']      # File names or glob patterns to match files in DATA_DIR
 VARIABLE_CHOICES = ['u']         # Variable names to search for (in priority order; first match used)
 
 # ---- Time Subset Configuration ----
@@ -110,7 +124,7 @@ RESDMD_MIN_KEEP   = 8
 
 # ---- Output Configuration ----
 # All figures and spatial snapshots saved to PLOT_OUTPUT_DIR.
-PLOT_OUTPUT_DIR         = '../plots'  # Root directory for all plot outputs
+PLOT_OUTPUT_DIR         = '../plots/univar'  # Root directory for all plot outputs
 SAVE_SPATIAL_SNAPSHOTS = True
 SPATIAL_SNAPSHOT_DIR   = 'spatial_snapshots'
 SPATIAL_SNAPSHOT_DPI   = 120
@@ -124,6 +138,9 @@ SPATIAL_COLOR_LIMIT    = None   # set numeric value to force +/- symmetric limit
 # 2. Select requested variable (first match from VARIABLE_CHOICES).
 # 3. Apply optional time/space subsetting (masking invalid/land points).
 # 4. Extract to numpy array and convert to 2D matrix format for DMD analysis.
+
+if DATA_SOURCE not in {'roms', 'remora'}:
+    raise ValueError(f"DATA_SOURCE must be 'roms' or 'remora', got: {DATA_SOURCE}")
 
 file_globs = [os.path.join(DATA_DIR, pat) for pat in FILE_PATTERNS]
 matched_files = sorted({f for pat in file_globs for f in glob.glob(pat)})
@@ -140,6 +157,7 @@ ds = xr.open_mfdataset(
     coords='minimal',
     compat='override',
 )
+print(f"Using data source '{DATA_SOURCE}' from {DATA_DIR}")
 
 os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
 
